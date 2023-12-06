@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional
 import fsspec.asyn
 import httpx
 import huggingface_hub
+import requests
 from huggingface_hub import SpaceStage
 from websockets.legacy.protocol import WebSocketCommonProtocol
 
@@ -133,6 +134,7 @@ class Status(Enum):
             "process_generating": Status.ITERATING,
             "process_completed": Status.FINISHED,
             "progress": Status.PROGRESS,
+            "heartbeat": Status.PROGRESS,
         }[msg]
 
 
@@ -224,11 +226,11 @@ def probe_url(possible_url: str) -> bool:
     """
     headers = {"User-Agent": "gradio (https://gradio.app/; team@gradio.app)"}
     try:
-        with httpx.Client() as client:
-            head_request = client.head(possible_url, headers=headers)
+        with requests.session() as sess:
+            head_request = sess.head(possible_url, headers=headers)
             if head_request.status_code == 405:
-                return client.get(possible_url, headers=headers).is_success
-            return head_request.is_success
+                return sess.get(possible_url, headers=headers).ok
+            return head_request.ok
     except Exception:
         return False
 
@@ -314,7 +316,6 @@ async def get_pred_from_sse(
     helper: Communicator,
     sse_url: str,
     sse_data_url: str,
-    headers: dict[str, str],
     cookies: dict[str, str] | None = None,
 ) -> dict[str, Any] | None:
     done, pending = await asyncio.wait(
@@ -322,14 +323,7 @@ async def get_pred_from_sse(
             asyncio.create_task(check_for_cancel(helper, cookies)),
             asyncio.create_task(
                 stream_sse(
-                    client,
-                    data,
-                    hash_data,
-                    helper,
-                    sse_url,
-                    sse_data_url,
-                    headers=headers,
-                    cookies=cookies,
+                    client, data, hash_data, helper, sse_url, sse_data_url, cookies
                 )
             ),
         ],
@@ -361,7 +355,6 @@ async def check_for_cancel(helper: Communicator, cookies: dict[str, str] | None)
             )
     raise CancelledError()
 
-
 async def stream_sse(
     client: httpx.AsyncClient,
     data: dict,
@@ -369,59 +362,78 @@ async def stream_sse(
     helper: Communicator,
     sse_url: str,
     sse_data_url: str,
-    headers: dict[str, str],
     cookies: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     try:
-        async with client.stream(
-            "GET",
-            sse_url,
-            params=hash_data,
-            cookies=cookies,
-            headers=headers,
-        ) as response:
-            async for line in response.aiter_text():
-                if line.startswith("data:"):
-                    resp = json.loads(line[5:])
-                    with helper.lock:
-                        has_progress = "progress_data" in resp
-                        status_update = StatusUpdate(
-                            code=Status.msg_to_status(resp["msg"]),
-                            queue_size=resp.get("queue_size"),
-                            rank=resp.get("rank", None),
-                            success=resp.get("success"),
-                            time=datetime.now(),
-                            eta=resp.get("rank_eta"),
-                            progress_data=ProgressUnit.from_msg(resp["progress_data"])
-                            if has_progress
-                            else None,
-                        )
-                        output = resp.get("output", {}).get("data", [])
-                        if output and status_update.code != Status.FINISHED:
-                            try:
-                                result = helper.prediction_processor(*output)
-                            except Exception as e:
-                                result = [e]
-                            helper.job.outputs.append(result)
-                        helper.job.latest_status = status_update
-
-                    if resp["msg"] == "queue_full":
-                        raise QueueError("Queue is full! Please try again.")
-                    elif resp["msg"] == "send_data":
-                        event_id = resp["event_id"]
-                        helper.event_id = event_id
-                        req = await client.post(
-                            sse_data_url,
-                            json={"event_id": event_id, **data, **hash_data},
-                            cookies=cookies,
-                            headers=headers,
-                        )
-                        req.raise_for_status()
-                    elif resp["msg"] == "process_completed":
-                        return resp["output"]
-                else:
-                    raise ValueError(f"Unexpected message: {line}")
-        raise ValueError("Did not receive process_completed message.")
+        ### MODIF MATHIEU 1 #################################################################################################################################################################################################
+        stream_is_valid = False
+        while not stream_is_valid:
+        #####################################################################################################################################################################################################################
+            async with client.stream(
+                "GET", sse_url, params=hash_data, cookies=cookies
+            ) as response:
+                async for line in response.aiter_text():
+                    ### MODIF MATHIEU 2 #####################################################################################################################################################################################
+                    debut = 'data: {"msg"'
+                    fin = '}'
+                    debut_index = line.find(debut)
+                    fin_index = line.rfind(fin)
+                    if debut_index != -1 and fin_index != -1:
+                        line = line[debut_index:fin_index + len(fin)]
+                    else :
+                        line = " "
+                    if len(line) > 0 and line.startswith("d") and line.endswith("}"):
+                        stream_is_valid = True
+                    else:
+                        continue
+                    index_occurrence = line.rfind('data: ')
+                    line = line[index_occurrence:]
+                    #########################################################################################################################################################################################################
+                    if line.startswith("data:"):
+                            ### MODIF MATHIEU 3 #############################################################################################################################################################################
+                        try:
+                            resp = json.loads(line[5:])
+                        except:
+                            resp = json.loads(line[5:] + "}")
+                            #########################################################################################################################################################################################################
+                        with helper.lock:
+                            has_progress = "progress_data" in resp
+                            status_update = StatusUpdate(
+                                code=Status.msg_to_status(resp["msg"]),
+                                queue_size=resp.get("queue_size"),
+                                rank=resp.get("rank", None),
+                                success=resp.get("success"),
+                                time=datetime.now(),
+                                eta=resp.get("rank_eta"),
+                                progress_data=ProgressUnit.from_msg(resp["progress_data"])
+                                if has_progress
+                                else None,
+                            )
+                            
+                            output = resp.get("output", {}).get("data", [])
+                            if output and status_update.code != Status.FINISHED:
+                                try:
+                                    result = helper.prediction_processor(*output)
+                                except Exception as e:
+                                    result = [e]
+                                helper.job.outputs.append(result)
+                            helper.job.latest_status = status_update
+                        if resp["msg"] == "queue_full":
+                            raise QueueError("Queue is full! Please try again.")
+                        elif resp["msg"] == "send_data":
+                            event_id = resp["event_id"]
+                            helper.event_id = event_id
+                            req = await client.post(
+                                sse_data_url,
+                                json={"event_id": event_id, **data, **hash_data},
+                                cookies=cookies,
+                            )
+                            req.raise_for_status()
+                        elif resp["msg"] == "process_completed":
+                            return resp["output"]
+                    else:
+                        raise ValueError(f"Unexpected message: {line}")
+            raise ValueError("Did not receive process_completed message.")
     except asyncio.CancelledError:
         raise
 
@@ -444,10 +456,10 @@ def download_file(
     temp_dir = Path(tempfile.gettempdir()) / secrets.token_hex(20)
     temp_dir.mkdir(exist_ok=True, parents=True)
 
-    with httpx.stream("GET", url_path, headers=headers) as response:
-        response.raise_for_status()
+    with requests.get(url_path, headers=headers, stream=True) as r:
+        r.raise_for_status()
         with open(temp_dir / Path(url_path).name, "wb") as f:
-            for chunk in response.iter_bytes(chunk_size=128 * sha1.block_size):
+            for chunk in r.iter_content(chunk_size=128 * sha1.block_size):
                 sha1.update(chunk)
                 f.write(chunk)
 
@@ -477,11 +489,10 @@ def download_tmp_copy_of_file(
     directory.mkdir(exist_ok=True, parents=True)
     file_path = directory / Path(url_path).name
 
-    with httpx.stream("GET", url_path, headers=headers) as response:
-        response.raise_for_status()
+    with requests.get(url_path, headers=headers, stream=True) as r:
+        r.raise_for_status()
         with open(file_path, "wb") as f:
-            for chunk in response.iter_raw():
-                f.write(chunk)
+            shutil.copyfileobj(r.raw, f)
     return str(file_path.resolve())
 
 
@@ -521,7 +532,7 @@ def encode_file_to_base64(f: str | Path):
 
 
 def encode_url_to_base64(url: str):
-    resp = httpx.get(url)
+    resp = requests.get(url)
     resp.raise_for_status()
     encoded_string = base64.b64encode(resp.content)
     base64_str = str(encoded_string, "utf-8")
@@ -643,17 +654,18 @@ def set_space_timeout(
         library_name="gradio_client",
         library_version=__version__,
     )
+    req = requests.post(
+        f"https://huggingface.co/api/spaces/{space_id}/sleeptime",
+        json={"seconds": timeout_in_seconds},
+        headers=headers,
+    )
     try:
-        httpx.post(
-            f"https://huggingface.co/api/spaces/{space_id}/sleeptime",
-            json={"seconds": timeout_in_seconds},
-            headers=headers,
-        )
-    except httpx.HTTPStatusError as e:
+        huggingface_hub.utils.hf_raise_for_status(req)
+    except huggingface_hub.utils.HfHubHTTPError as err:
         raise SpaceDuplicationError(
             f"Could not set sleep timeout on duplicated Space. Please visit {SPACE_URL.format(space_id)} "
             "to set a timeout manually to reduce billing charges."
-        ) from e
+        ) from err
 
 
 ########################
